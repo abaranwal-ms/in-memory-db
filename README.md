@@ -47,3 +47,11 @@ go run ./cmd/seed -bytes 1073741824      # 1 GB
 ```bash
 go test -v ./...
 ```
+
+## API Smoke Test
+
+With the server running, use the PowerShell script to verify all REST operations:
+
+```powershell
+.\test-api.ps1
+```
