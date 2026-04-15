@@ -72,8 +72,27 @@ How are fileNames handled for the same second multiple file created?
 
     Allowing for 20 bytes. 16GB ram ~ 0.8 * 10^9 records
 
----------------------------------
+---------------------------------Merge and Compaction------------
+1. Take first 3 files for Merge, and take a target a new file
+2. Iterate over each item, and check if they are in the memory map, then move the item to new file and update map.
+3. If they are not in the memory map, discard the record and move to next record.
+4. Run the merge and compaction every 15 seconds
+5. Once the 3 files are done, remove the files from the file list in the store.
 
-TODO : 
-1. Merge and Compaction Implementation, will include fileNames in separate list with pointer to latest file     
+--------------------------------
+
+
+DONE : 
+
+2. Bootstrapping the service
+   - main.go starts the HTTP server on :8080 with PUT/GET/DELETE /kv/{key} and POST /compact endpoints.
+   - On boot, NewStore replays all .dat files in chronological order to rebuild the in-memory index.
+   - A background goroutine runs Compact() every 15 seconds using the small stop-the-world strategy.
+   - Graceful shutdown via SIGINT/SIGTERM stops the compaction loop and closes the active file.
+
 3. Seeding data and simulating around 2-3 GB worth of updates
+   - cmd/seed/main.go is a load generator that sends concurrent HTTP requests to the running server.
+   - Defaults: 3 GB of writes, 16 workers, 500K unique key space, 200-byte values, 5% delete ratio.
+   - Overwrites across the key space create stale records, exercising compaction under load.
+   - Reports throughput (ops/sec, GB written) every 5 seconds.
+   - Usage: go run ./cmd/seed [-bytes N] [-workers N] [-keys N] [-vsize N] [-delete 0.05]

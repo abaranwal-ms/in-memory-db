@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 const maxValueSize = 1 << 20 // 1 MB
@@ -68,14 +69,42 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	})
 
+	mux.HandleFunc("POST /compact", func(w http.ResponseWriter, r *http.Request) {
+		if err := store.Compact(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
 	addr := ":8080"
 	log.Printf("kv-inmem listening on %s", addr)
+
+	// Background compaction every 15 seconds.
+	compactDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := store.Compact(); err != nil {
+					log.Printf("compaction error: %v", err)
+				} else {
+					log.Println("compaction complete")
+				}
+			case <-compactDone:
+				return
+			}
+		}
+	}()
 
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
 		fmt.Println("\nshutting down...")
+		close(compactDone)
 		store.Close()
 		os.Exit(0)
 	}()
