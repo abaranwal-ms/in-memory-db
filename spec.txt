@@ -68,9 +68,9 @@ How are fileNames handled for the same second multiple file created?
     A record in memory takes 
         8 byte for key, 
         4 byte for 32 bit offset, can support upto 200 MB easily. A 4 byte offset can store 2^32 -1 which is 4,294,967,295$ (~4 GB)
-        4 byte for fileName which is timestamp (assuming seconds)
+        8 byte for fileName which is timestamp (assuming seconds)
 
-    Allowing for 16 bytes. 16GB ram ~ 2 * 10^9 records
+    Allowing for 20 bytes. 16GB ram ~ 0.8 * 10^9 records
 
 ---------------------------------
 
