@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"os"
@@ -450,4 +451,134 @@ func TestLoadGeneratorWithCompaction(t *testing.T) {
 	}
 
 	t.Logf("verified %d keys after reload", len(truth))
+}
+
+// --- Integrity failure tests ---
+
+func TestCRCCorruptionOnGet(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.Put("foo", "bar")
+	entry := s.index["foo"]
+	s.Close()
+
+	// Flip a byte in the value portion of the record on disk.
+	path := filepath.Join(dir, entry.FileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The value "bar" starts at offset 12 + len("foo") = 15. Corrupt it.
+	data[15] ^= 0xFF
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := NewStore(dir)
+	if err != nil {
+		// Corruption caught during replay — also valid.
+		if !strings.Contains(err.Error(), "crc mismatch") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		t.Log("corruption detected during replay (expected)")
+		return
+	}
+	defer s2.Close()
+
+	// If replay didn't catch it (entry was rebuilt), Get should fail.
+	_, _, err = s2.Get("foo")
+	if err == nil {
+		t.Fatal("expected CRC error on corrupted record")
+	}
+	if !strings.Contains(err.Error(), "crc mismatch") {
+		t.Fatalf("expected 'crc mismatch', got: %v", err)
+	}
+	t.Log("corruption detected on Get (expected)")
+}
+
+func TestTruncatedRecord(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.Put("hello", "world")
+	fname := s.activeFileName
+	s.Close()
+
+	// Truncate the file to cut the record in half (keep only 8 of 12 header bytes).
+	path := filepath.Join(dir, fname)
+	if err := os.Truncate(path, 8); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = NewStore(dir)
+	if err == nil {
+		t.Fatal("expected error when replaying truncated record")
+	}
+	if !strings.Contains(err.Error(), "corrupt record") {
+		t.Fatalf("expected 'corrupt record', got: %v", err)
+	}
+	t.Logf("truncation detected: %v", err)
+}
+
+func TestTruncatedBody(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.Put("key", "a]longer-value-that-gets-truncated")
+	fname := s.activeFileName
+	s.Close()
+
+	// Keep the full 12-byte header but chop the body.
+	path := filepath.Join(dir, fname)
+	if err := os.Truncate(path, 14); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = NewStore(dir)
+	if err == nil {
+		t.Fatal("expected error when replaying truncated body")
+	}
+	if !strings.Contains(err.Error(), "corrupt record") {
+		t.Fatalf("expected 'corrupt record', got: %v", err)
+	}
+	t.Logf("truncated body detected: %v", err)
+}
+
+func TestCorruptedKeyLength(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.Put("foo", "bar")
+	fname := s.activeFileName
+	s.Close()
+
+	// Corrupt keyLen field (bytes 4-7) to an absurdly large value.
+	path := filepath.Join(dir, fname)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint32(data[4:8], 0xFFFFFFFF)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = NewStore(dir)
+	if err == nil {
+		t.Fatal("expected error when replaying record with corrupted key length")
+	}
+	t.Logf("corrupted key length detected: %v", err)
 }
