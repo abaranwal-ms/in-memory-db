@@ -230,6 +230,185 @@ func (s *Store) Delete(key string) error {
 	return nil
 }
 
+// Compact merges all inactive (non-active) data files into new compacted files,
+// keeping only the live records that the in-memory index still points to.
+// Old inactive files are deleted after compaction.
+//
+// Strategy: "Small Stop-the-World"
+//
+// Instead of holding a write-lock for the entire compaction (which would block
+// all reads and writes), we split the work into three phases with two very
+// brief lock windows and one lock-free I/O phase:
+//
+//	Phase 1 — Snapshot (RLock):
+//	  Take a read-lock just long enough to capture which files are inactive
+//	  and which index entries point into them. This is a fast in-memory scan.
+//	  Reads and writes are NOT blocked during this phase (RLock allows concurrent reads).
+//
+//	Phase 2 — Rewrite (no lock):
+//	  Read every live record from the old immutable files and write them into
+//	  a new compacted file. No lock is held, so Put/Get/Delete proceed freely
+//	  against the active file. Because inactive files are append-only and
+//	  never modified, reading them without a lock is safe.
+//
+//	Phase 3 — Swap (Lock):
+//	  Take a brief write-lock to atomically swap each index entry from the
+//	  old file location to the new compacted file location. A key is only
+//	  updated if it still points to the same file+offset captured in the
+//	  snapshot — if a concurrent Put overwrote it or a Delete removed it,
+//	  the stale compacted copy is simply ignored. Old files are then deleted.
+//
+// The two "stop-the-world" windows (Phase 1 and 3) are proportional to the
+// number of live keys, not the size of the data on disk, keeping pause times
+// small regardless of how much data is being compacted.
+func (s *Store) Compact() error {
+	// Phase 1 (Snapshot): brief read-lock to capture inactive files and their live keys.
+	s.mu.RLock()
+	activeFile := s.activeFileName
+
+	entries, err := os.ReadDir(s.dataDir)
+	if err != nil {
+		s.mu.RUnlock()
+		return err
+	}
+
+	var inactiveFiles []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".dat") && e.Name() != activeFile {
+			inactiveFiles = append(inactiveFiles, e.Name())
+		}
+	}
+
+	if len(inactiveFiles) == 0 {
+		s.mu.RUnlock()
+		return nil
+	}
+
+	inactiveSet := make(map[string]struct{}, len(inactiveFiles))
+	for _, f := range inactiveFiles {
+		inactiveSet[f] = struct{}{}
+	}
+
+	// Snapshot: key -> IndexEntry for keys living in inactive files.
+	snapshot := make(map[string]IndexEntry)
+	for key, entry := range s.index {
+		if _, ok := inactiveSet[entry.FileName]; ok {
+			snapshot[key] = entry
+		}
+	}
+	s.mu.RUnlock()
+
+	if len(snapshot) == 0 {
+		// No live keys in inactive files — just delete the stale files.
+		for _, fname := range inactiveFiles {
+			os.Remove(filepath.Join(s.dataDir, fname))
+		}
+		return nil
+	}
+
+	// Phase 2 (Rewrite): heavy I/O with no lock held.
+	// Read live records from immutable old files, write them into a new compacted file.
+	var compactFile *os.File
+	var compactName string
+	var compactOffset int32
+
+	closeCompactFile := func() {
+		if compactFile != nil {
+			compactFile.Close()
+			compactFile = nil
+		}
+	}
+
+	newCompactFile := func() error {
+		closeCompactFile()
+		name := fmt.Sprintf("c_%d.dat", time.Now().UnixMilli())
+		f, err := os.OpenFile(filepath.Join(s.dataDir, name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return err
+		}
+		compactFile = f
+		compactName = name
+		compactOffset = 0
+		return nil
+	}
+
+	if err := newCompactFile(); err != nil {
+		return err
+	}
+	defer closeCompactFile()
+
+	// newEntries collects the index updates to apply atomically later.
+	type compactedEntry struct {
+		key   string
+		entry IndexEntry
+	}
+	var newEntries []compactedEntry
+
+	for key, snapEntry := range snapshot {
+		// Read the record from the old file (no lock needed — file is immutable).
+		f, err := os.Open(filepath.Join(s.dataDir, snapEntry.FileName))
+		if err != nil {
+			return err
+		}
+		if _, err := f.Seek(snapEntry.Offset, io.SeekStart); err != nil {
+			f.Close()
+			return err
+		}
+		_, value, _, err := decodeRecord(f)
+		f.Close()
+		if err != nil {
+			return err
+		}
+
+		record := encodeRecord(key, value)
+
+		if int64(compactOffset)+int64(len(record)) > maxFileSize {
+			if err := newCompactFile(); err != nil {
+				return err
+			}
+		}
+
+		if _, err := compactFile.Write(record); err != nil {
+			return err
+		}
+
+		newEntries = append(newEntries, compactedEntry{
+			key: key,
+			entry: IndexEntry{
+				FileName:     compactName,
+				Offset:       int64(compactOffset),
+				RecordLength: int32(len(record)),
+			},
+		})
+		compactOffset += int32(len(record))
+	}
+
+	closeCompactFile()
+
+	// Phase 3 (Swap): brief write-lock to atomically update index entries.
+	// Only entries that haven't been modified by concurrent Put/Delete are swapped.
+	s.mu.Lock()
+	for _, ce := range newEntries {
+		current, exists := s.index[ce.key]
+		if !exists {
+			// Key was deleted during compaction — skip.
+			continue
+		}
+		// Only update if the key still points to the same old file+offset
+		// (i.e. it wasn't overwritten by a concurrent Put).
+		if current.FileName == snapshot[ce.key].FileName && current.Offset == snapshot[ce.key].Offset {
+			s.index[ce.key] = ce.entry
+		}
+	}
+	s.mu.Unlock()
+
+	for _, fname := range inactiveFiles {
+		os.Remove(filepath.Join(s.dataDir, fname))
+	}
+
+	return nil
+}
+
 // Close flushes and closes the active file.
 func (s *Store) Close() error {
 	s.mu.Lock()
