@@ -1,0 +1,79 @@
+this is a key value system, where key is a string of word, and its value is a complex data type.
+For prototyping we choose a simple string for value, we can evolve to complex data type simply.
+
+The app opens these files in append only mode, for each value upsert you tend to save the value, and override the value in memory.
+For each delete you store a flag -1.
+
+Example: 
+
+New file, no content.
+
+Memory, no content.
+
+client: does a PUT of foo with value bar
+filesystem: append foo, bar to file.
+memory, store [foo] = bar
+
+client: does a PUT of foo1 with value bar1
+filesystem: append foo, bar to file.
+memory, store [foo] = bar
+
+client: delete foo1.
+filesystem: foo1: -1
+memory, delete [foo1]
+
+File:
+
+foo,bar
+foo1,bar1
+foo1,\0
+
+simple assumption for POC, no value implies delete. 
+
+Map (In memory):
+
+foo -> Pointer to where bar is written (the 0 offset)
+
+-----------File Impl------------------------
+
+
+You want to be able to read foo, bar from file as quick as possible. So we perform optimizations on file
+
+We store the key, the value, and their lengths preceeding to them which help identify how many bytes to read. So, you write <lengthKey, lengthVal, Key, Value >on file.
+
+Extending this further, we store lengthKey, lengthVal in binary format, so each taking 4 bytes to write. Then we write the chars of word and value.
+
+Then we store 4 byte CRC of entire record.
+
+So, our file write looks like
+CRC in 4 Byte , Length of key in 4 bytes, length of value in 4 bytes, the key in char, the value in char.
+
+--------------------Memory Impl---------------------------------
+
+In memory, we just need a pointer to this record, which is the offset starting at CRC. Also, to read entire record in one go, save the length of the entire record and read it one go.
+
+As data, grows we want to limit our files to grow too large. So, we keep a threashold, if our offset at a file is already > 200 MB, we create a new file. 
+
+Thus, our memory also stores fileName for a key.
+
+<foo> -> 
+{
+    fileName,
+    recordLength,
+    offset
+}
+
+How are fileNames handled for the same second multiple file created?
+    40 bytes on average per record, 200 MB / 40 B = 5 Million records, so timestamp per second can work. but, if thats not enough then timestamp per ms.
+    A record in memory takes 
+        8 byte for key, 
+        4 byte for 32 bit offset, can support upto 200 MB easily. A 4 byte offset can store 2^32 -1 which is 4,294,967,295$ (~4 GB)
+        4 byte for fileName which is timestamp (assuming seconds)
+
+    Allowing for 16 bytes. 16GB ram ~ 2 * 10^9 records
+
+---------------------------------
+
+TODO : 
+1. Merge and Compaction Implementation, will include fileNames in separate list with pointer to latest file     
+3. Seeding data and simulating around 2-3 GB worth of updates
